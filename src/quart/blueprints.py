@@ -9,7 +9,7 @@ from aiofiles import open as async_open
 from aiofiles.base import AiofilesContextManager
 from flask.sansio.app import App
 from flask.sansio.blueprints import Blueprint as SansioBlueprint  # noqa
-from flask.sansio.blueprints import BlueprintSetupState as BlueprintSetupState  # noqa
+from flask.sansio.blueprints import BlueprintSetupState as SansioBlueprintSetupState
 from flask.sansio.scaffold import setupmethod
 
 from .cli import AppGroup
@@ -20,21 +20,47 @@ from .typing import AfterWebsocketCallable
 from .typing import AppOrBlueprintKey
 from .typing import BeforeServingCallable
 from .typing import BeforeWebsocketCallable
+from .typing import BlueprintLifecycleCallable
 from .typing import FilePath
 from .typing import TeardownCallable
 from .typing import WebsocketCallable
 from .typing import WhileServingCallable
 
 if t.TYPE_CHECKING:
+    from .app import Quart
     from .wrappers import Response
 
 T_after_serving = t.TypeVar("T_after_serving", bound=AfterServingCallable)
 T_after_websocket = t.TypeVar("T_after_websocket", bound=AfterWebsocketCallable)
 T_before_serving = t.TypeVar("T_before_serving", bound=BeforeServingCallable)
 T_before_websocket = t.TypeVar("T_before_websocket", bound=BeforeWebsocketCallable)
+T_blueprint_lifecycle = t.TypeVar(
+    "T_blueprint_lifecycle", bound=BlueprintLifecycleCallable
+)
 T_teardown = t.TypeVar("T_teardown", bound=TeardownCallable)
 T_websocket = t.TypeVar("T_websocket", bound=WebsocketCallable)
 T_while_serving = t.TypeVar("T_while_serving", bound=WhileServingCallable)
+
+
+class BlueprintSetupState(SansioBlueprintSetupState):
+    """Temporary holder object for registering a blueprint with the
+    application.
+
+    This extends the Flask setup state to support the registration of
+    blueprint lifecycle hooks (startup and shutdown), ensuring the
+    hooks are collected by the app as the blueprint is registered.
+    """
+
+    def add_lifecycle_hook(self, hook: str, func: BlueprintLifecycleCallable) -> None:
+        """Register a lifecycle ``func`` under the ``hook`` name for the
+        blueprint being registered.
+
+        The blueprint's full dotted name is used, so hooks of nested
+        blueprints are collected under their own (nested) name.
+        """
+        app = t.cast("Quart", self.app)
+        name = f"{self.name_prefix}.{self.name}".lstrip(".")
+        app._add_blueprint_lifecycle_hook(name, hook, func)
 
 
 class Blueprint(SansioBlueprint):
@@ -62,6 +88,18 @@ class Blueprint(SansioBlueprint):
         self.teardown_websocket_funcs: dict[
             AppOrBlueprintKey, list[TeardownCallable]
         ] = defaultdict(list)
+
+    def make_setup_state(
+        self,
+        app: App,
+        options: dict[str, t.Any],
+        first_registration: bool = False,
+    ) -> BlueprintSetupState:
+        """Creates an instance of :class:`BlueprintSetupState` that is
+        passed to the register callback functions, allowing lifecycle
+        hooks to be collected as the blueprint is registered.
+        """
+        return BlueprintSetupState(self, app, options, first_registration)
 
     def get_send_file_max_age(self, filename: str | None) -> int | None:
         """Used by :func:`send_file` to determine the ``max_age`` cache
@@ -371,6 +409,100 @@ class Blueprint(SansioBlueprint):
 
         """
         self.record_once(lambda state: state.app.while_serving(func))  # type: ignore[attr-defined]
+        return func
+
+    @setupmethod
+    def before_app_startup(self, func: T_blueprint_lifecycle) -> T_blueprint_lifecycle:
+        """Add a before startup hook to the App.
+
+        This is designed to be used as a decorator. The function is
+        called during the app's startup, after the app level
+        ``before_serving`` functions, in blueprint registration order.
+        It allows the blueprint to manage its own resources (such as
+        database connection pools or cache clients). An example usage,
+
+        .. code-block:: python
+
+            blueprint = Blueprint(__name__)
+            @blueprint.before_app_startup
+            async def startup():
+                ...
+
+        A failing hook does not prevent other blueprints from starting,
+        nor does it fail the app startup. The failure is collected in
+        :attr:`~quart.Quart.blueprint_startup_errors`.
+        """
+        self.record_once(
+            lambda state: state.add_lifecycle_hook("before_app_startup", func)  # type: ignore[attr-defined]
+        )
+        return func
+
+    @setupmethod
+    def after_app_startup(self, func: T_blueprint_lifecycle) -> T_blueprint_lifecycle:
+        """Add an after startup hook to the App.
+
+        This is designed to be used as a decorator, and has the same
+        arguments as :meth:`~quart.Blueprint.before_app_startup`. It is
+        called at the end of the app's startup, after all the
+        ``before_app_startup`` hooks. An example usage,
+
+        .. code-block:: python
+
+            blueprint = Blueprint(__name__)
+            @blueprint.after_app_startup
+            async def startup():
+                ...
+        """
+        self.record_once(
+            lambda state: state.add_lifecycle_hook("after_app_startup", func)  # type: ignore[attr-defined]
+        )
+        return func
+
+    @setupmethod
+    def before_app_shutdown(self, func: T_blueprint_lifecycle) -> T_blueprint_lifecycle:
+        """Add a before shutdown hook to the App.
+
+        This is designed to be used as a decorator, and has the same
+        arguments as :meth:`~quart.Blueprint.before_app_startup`. It is
+        called at the start of the app's shutdown, before the app level
+        ``after_serving`` functions, in blueprint registration order.
+        An example usage,
+
+        .. code-block:: python
+
+            blueprint = Blueprint(__name__)
+            @blueprint.before_app_shutdown
+            async def shutdown():
+                ...
+
+        A failing hook does not prevent other blueprints from shutting
+        down. The failure is collected in
+        :attr:`~quart.Quart.blueprint_shutdown_errors`.
+        """
+        self.record_once(
+            lambda state: state.add_lifecycle_hook("before_app_shutdown", func)  # type: ignore[attr-defined]
+        )
+        return func
+
+    @setupmethod
+    def after_app_shutdown(self, func: T_blueprint_lifecycle) -> T_blueprint_lifecycle:
+        """Add an after shutdown hook to the App.
+
+        This is designed to be used as a decorator, and has the same
+        arguments as :meth:`~quart.Blueprint.before_app_startup`. It is
+        called at the end of the app's shutdown, after all the
+        ``before_app_shutdown`` hooks. An example usage,
+
+        .. code-block:: python
+
+            blueprint = Blueprint(__name__)
+            @blueprint.after_app_shutdown
+            async def shutdown():
+                ...
+        """
+        self.record_once(
+            lambda state: state.add_lifecycle_hook("after_app_shutdown", func)  # type: ignore[attr-defined]
+        )
         return func
 
     @setupmethod

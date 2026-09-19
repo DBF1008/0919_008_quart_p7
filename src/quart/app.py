@@ -314,6 +314,11 @@ class Quart(App):
                 a request.
             before_websocket_funcs: The functions to execute before handling
                 a websocket.
+            blueprint_startup_errors: The errors raised by blueprint
+                startup hooks, keyed by blueprint name. A blueprint
+                failing to start up does not fail the app startup.
+            blueprint_shutdown_errors: The errors raised by blueprint
+                shutdown hooks, keyed by blueprint name.
         """
         super().__init__(
             import_name,
@@ -337,6 +342,16 @@ class Quart(App):
         self.before_websocket_funcs: dict[
             AppOrBlueprintKey, list[BeforeWebsocketCallable]
         ] = defaultdict(list)
+        self.blueprint_lifecycle_hooks: dict[
+            str, dict[str, list[Callable[[], Awaitable[None]]]]
+        ] = {
+            "before_app_startup": defaultdict(list),
+            "after_app_startup": defaultdict(list),
+            "before_app_shutdown": defaultdict(list),
+            "after_app_shutdown": defaultdict(list),
+        }
+        self.blueprint_startup_errors: dict[str, list[Exception]] = defaultdict(list)
+        self.blueprint_shutdown_errors: dict[str, list[Exception]] = defaultdict(list)
         self.teardown_websocket_funcs: dict[
             AppOrBlueprintKey, list[TeardownCallable]
         ] = defaultdict(list)
@@ -1764,12 +1779,19 @@ class Quart(App):
 
     async def startup(self) -> None:
         self.shutdown_event = self.event_class()
+        self.blueprint_startup_errors.clear()
         try:
             async with self.app_context():
                 for func in self.before_serving_funcs:
                     await self.ensure_async(func)()
                 for gen in self.while_serving_gens:
                     await gen.__anext__()
+                await self._run_blueprint_lifecycle_hooks(
+                    "before_app_startup", self.blueprint_startup_errors
+                )
+                await self._run_blueprint_lifecycle_hooks(
+                    "after_app_startup", self.blueprint_startup_errors
+                )
         except Exception as error:
             await got_serving_exception.send_async(
                 self,
@@ -1781,6 +1803,7 @@ class Quart(App):
 
     async def shutdown(self) -> None:
         self.shutdown_event.set()
+        self.blueprint_shutdown_errors.clear()
         try:
             await asyncio.wait_for(
                 asyncio.gather(*self.background_tasks),
@@ -1791,6 +1814,12 @@ class Quart(App):
 
         try:
             async with self.app_context():
+                await self._run_blueprint_lifecycle_hooks(
+                    "before_app_shutdown", self.blueprint_shutdown_errors
+                )
+                await self._run_blueprint_lifecycle_hooks(
+                    "after_app_shutdown", self.blueprint_shutdown_errors
+                )
                 for func in self.after_serving_funcs:
                     await self.ensure_async(func)()
                 for gen in self.while_serving_gens:
@@ -1808,6 +1837,46 @@ class Quart(App):
             )
             self.log_exception(sys.exc_info())
             raise
+
+    def _add_blueprint_lifecycle_hook(
+        self,
+        blueprint_name: str,
+        hook: str,
+        func: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Collect a blueprint lifecycle ``func`` under ``hook``.
+
+        This is called by the blueprint setup state as blueprints are
+        registered, ensuring the hooks are triggered in blueprint
+        registration order (nested blueprints follow their parents).
+        """
+        self.blueprint_lifecycle_hooks[hook][blueprint_name].append(func)
+
+    async def _run_blueprint_lifecycle_hooks(
+        self,
+        hook: str,
+        errors: dict[str, list[Exception]],
+    ) -> None:
+        """Run the collected blueprint lifecycle ``hook`` functions.
+
+        This provides a blueprint level error boundary: a failing hook
+        does not prevent the other blueprints' hooks from running, nor
+        does it fail the app. Instead the failure is collected in
+        ``errors`` (keyed by blueprint name) and reported via the
+        ``got_serving_exception`` signal and the logs.
+        """
+        for blueprint_name, funcs in self.blueprint_lifecycle_hooks[hook].items():
+            for func in funcs:
+                try:
+                    await self.ensure_async(func)()
+                except Exception as error:
+                    errors[blueprint_name].append(error)
+                    await got_serving_exception.send_async(
+                        self,
+                        _sync_wrapper=self.ensure_async,  # type: ignore[arg-type]
+                        exception=error,
+                    )
+                    self.log_exception(sys.exc_info())
 
 
 def _cancel_all_tasks(loop: asyncio.AbstractEventLoop) -> None:

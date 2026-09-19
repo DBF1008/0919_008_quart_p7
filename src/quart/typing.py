@@ -96,6 +96,7 @@ BeforeWebsocketCallable = Union[
     Callable[[], Optional[ResponseReturnValue]],
     Callable[[], Awaitable[Optional[ResponseReturnValue]]],
 ]
+BlueprintLifecycleCallable = Union[Callable[[], None], Callable[[], Awaitable[None]]]
 ErrorHandlerCallable = Union[
     Callable[[Any], ResponseReturnValue],
     Callable[[Any], Awaitable[ResponseReturnValue]],
