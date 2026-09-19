@@ -337,6 +337,14 @@ class Quart(App):
         self.before_websocket_funcs: dict[
             AppOrBlueprintKey, list[BeforeWebsocketCallable]
         ] = defaultdict(list)
+        self.blueprint_startup_funcs: dict[
+            str, list[Callable[[], Awaitable[None]]]
+        ] = defaultdict(list)
+        self.blueprint_shutdown_funcs: dict[
+            str, list[Callable[[], Awaitable[None]]]
+        ] = defaultdict(list)
+        self.blueprint_startup_errors: dict[str, list[Exception]] = defaultdict(list)
+        self.blueprint_shutdown_errors: dict[str, list[Exception]] = defaultdict(list)
         self.teardown_websocket_funcs: dict[
             AppOrBlueprintKey, list[TeardownCallable]
         ] = defaultdict(list)
@@ -1770,6 +1778,7 @@ class Quart(App):
                     await self.ensure_async(func)()
                 for gen in self.while_serving_gens:
                     await gen.__anext__()
+                await self._run_blueprint_startup_hooks()
         except Exception as error:
             await got_serving_exception.send_async(
                 self,
@@ -1778,6 +1787,52 @@ class Quart(App):
             )
             self.log_exception(sys.exc_info())
             raise
+
+    async def _run_blueprint_startup_hooks(self) -> None:
+        """Run the blueprint startup hooks in registration order.
+
+        Each blueprint's hooks are isolated: a failure is collected on
+        :attr:`blueprint_startup_errors`, reported via the
+        ``got_serving_exception`` signal and logged, but it neither
+        prevents the remaining blueprints from starting nor fails the
+        app's startup.
+        """
+        self.blueprint_startup_errors.clear()
+        for name, funcs in self.blueprint_startup_funcs.items():
+            for func in funcs:
+                try:
+                    await self.ensure_async(func)()
+                except Exception as error:
+                    self.blueprint_startup_errors[name].append(error)
+                    await got_serving_exception.send_async(
+                        self,
+                        _sync_wrapper=self.ensure_async,  # type: ignore[arg-type]
+                        exception=error,
+                    )
+                    self.log_exception(sys.exc_info())
+
+    async def _run_blueprint_shutdown_hooks(self) -> None:
+        """Run the blueprint shutdown hooks in reverse registration order.
+
+        Each blueprint's hooks are isolated: a failure is collected on
+        :attr:`blueprint_shutdown_errors`, reported via the
+        ``got_serving_exception`` signal and logged, but it neither
+        prevents the remaining blueprints from shutting down nor fails
+        the app's shutdown.
+        """
+        self.blueprint_shutdown_errors.clear()
+        for name, funcs in reversed(list(self.blueprint_shutdown_funcs.items())):
+            for func in reversed(funcs):
+                try:
+                    await self.ensure_async(func)()
+                except Exception as error:
+                    self.blueprint_shutdown_errors[name].append(error)
+                    await got_serving_exception.send_async(
+                        self,
+                        _sync_wrapper=self.ensure_async,  # type: ignore[arg-type]
+                        exception=error,
+                    )
+                    self.log_exception(sys.exc_info())
 
     async def shutdown(self) -> None:
         self.shutdown_event.set()
@@ -1791,6 +1846,7 @@ class Quart(App):
 
         try:
             async with self.app_context():
+                await self._run_blueprint_shutdown_hooks()
                 for func in self.after_serving_funcs:
                     await self.ensure_async(func)()
                 for gen in self.while_serving_gens:

@@ -465,3 +465,188 @@ async def test_nested_callback_order() -> None:
         await (await client.get("/a")).get_data()
     ) == b"app_1, app_2, parent_1, parent_2, child_1, child_2"
     assert (await (await client.get("/b")).get_data()) == b"child"
+
+
+async def test_blueprint_lifecycle_hooks() -> None:
+    startup = False
+    shutdown = False
+
+    app = Quart(__name__)
+    blueprint = Blueprint("blueprint", __name__)
+
+    @blueprint.before_app_startup
+    async def startup_hook() -> None:
+        nonlocal startup
+        startup = True
+
+    @blueprint.after_app_shutdown
+    async def shutdown_hook() -> None:
+        nonlocal shutdown
+        shutdown = True
+
+    app.register_blueprint(blueprint)
+
+    assert not startup
+    async with app.test_app():
+        assert startup
+        assert not shutdown
+    assert shutdown
+    assert app.blueprint_startup_errors == {}
+    assert app.blueprint_shutdown_errors == {}
+
+
+async def test_blueprint_lifecycle_sync_hooks() -> None:
+    calls = []
+
+    app = Quart(__name__)
+    blueprint = Blueprint("blueprint", __name__)
+
+    @blueprint.before_app_startup
+    def startup_hook() -> None:
+        calls.append("startup")
+
+    @blueprint.after_app_shutdown
+    def shutdown_hook() -> None:
+        calls.append("shutdown")
+
+    app.register_blueprint(blueprint)
+
+    async with app.test_app():
+        pass
+    assert calls == ["startup", "shutdown"]
+
+
+async def test_blueprint_lifecycle_registration_order() -> None:
+    calls = []
+
+    app = Quart(__name__)
+    first = Blueprint("first", __name__)
+    second = Blueprint("second", __name__)
+
+    @first.before_app_startup
+    async def first_startup() -> None:
+        calls.append("first_startup")
+
+    @first.after_app_shutdown
+    async def first_shutdown() -> None:
+        calls.append("first_shutdown")
+
+    @second.before_app_startup
+    async def second_startup() -> None:
+        calls.append("second_startup")
+
+    @second.after_app_shutdown
+    async def second_shutdown() -> None:
+        calls.append("second_shutdown")
+
+    app.register_blueprint(first)
+    app.register_blueprint(second)
+
+    async with app.test_app():
+        assert calls == ["first_startup", "second_startup"]
+    # Shutdown hooks run in reverse registration order
+    assert calls == [
+        "first_startup",
+        "second_startup",
+        "second_shutdown",
+        "first_shutdown",
+    ]
+
+
+async def test_nested_blueprint_lifecycle_order() -> None:
+    calls = []
+
+    app = Quart(__name__)
+    parent = Blueprint("parent", __name__)
+    child = Blueprint("child", __name__)
+
+    @parent.before_app_startup
+    async def parent_startup() -> None:
+        calls.append("parent_startup")
+
+    @parent.after_app_shutdown
+    async def parent_shutdown() -> None:
+        calls.append("parent_shutdown")
+
+    @child.before_app_startup
+    async def child_startup() -> None:
+        calls.append("child_startup")
+
+    @child.after_app_shutdown
+    async def child_shutdown() -> None:
+        calls.append("child_shutdown")
+
+    parent.register_blueprint(child)
+    app.register_blueprint(parent)
+
+    async with app.test_app():
+        # Parent hooks run before nested child hooks
+        assert calls == ["parent_startup", "child_startup"]
+    # Shutdown is the reverse: child hooks run before parent hooks
+    assert calls == [
+        "parent_startup",
+        "child_startup",
+        "child_shutdown",
+        "parent_shutdown",
+    ]
+
+
+async def test_blueprint_startup_error_isolation() -> None:
+    calls = []
+
+    app = Quart(__name__)
+    failing = Blueprint("failing", __name__)
+    healthy = Blueprint("healthy", __name__)
+
+    @failing.before_app_startup
+    async def failing_startup() -> None:
+        raise RuntimeError("failing blueprint startup")
+
+    @healthy.before_app_startup
+    async def healthy_startup() -> None:
+        calls.append("healthy_startup")
+
+    app.register_blueprint(failing)
+    app.register_blueprint(healthy)
+
+    # The failing blueprint must not fail the app startup, nor prevent
+    # the healthy blueprint from starting.
+    async with app.test_app():
+        assert calls == ["healthy_startup"]
+
+    errors = app.blueprint_startup_errors
+    assert list(errors.keys()) == ["failing"]
+    assert len(errors["failing"]) == 1
+    assert str(errors["failing"][0]) == "failing blueprint startup"
+    assert app.blueprint_shutdown_errors == {}
+
+
+async def test_blueprint_shutdown_error_isolation() -> None:
+    calls = []
+
+    app = Quart(__name__)
+    failing = Blueprint("failing", __name__)
+    healthy = Blueprint("healthy", __name__)
+
+    @failing.after_app_shutdown
+    async def failing_shutdown() -> None:
+        raise RuntimeError("failing blueprint shutdown")
+
+    @healthy.after_app_shutdown
+    async def healthy_shutdown() -> None:
+        calls.append("healthy_shutdown")
+
+    app.register_blueprint(failing)
+    app.register_blueprint(healthy)
+
+    # The failing blueprint must not fail the app shutdown, nor
+    # prevent the healthy blueprint from shutting down.
+    async with app.test_app():
+        pass
+
+    assert calls == ["healthy_shutdown"]
+    errors = app.blueprint_shutdown_errors
+    assert list(errors.keys()) == ["failing"]
+    assert len(errors["failing"]) == 1
+    assert str(errors["failing"][0]) == "failing blueprint shutdown"
+    assert app.blueprint_startup_errors == {}

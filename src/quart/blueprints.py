@@ -9,7 +9,7 @@ from aiofiles import open as async_open
 from aiofiles.base import AiofilesContextManager
 from flask.sansio.app import App
 from flask.sansio.blueprints import Blueprint as SansioBlueprint  # noqa
-from flask.sansio.blueprints import BlueprintSetupState as BlueprintSetupState  # noqa
+from flask.sansio.blueprints import BlueprintSetupState as SansioBlueprintSetupState
 from flask.sansio.scaffold import setupmethod
 
 from .cli import AppGroup
@@ -37,6 +37,24 @@ T_websocket = t.TypeVar("T_websocket", bound=WebsocketCallable)
 T_while_serving = t.TypeVar("T_while_serving", bound=WhileServingCallable)
 
 
+class BlueprintSetupState(SansioBlueprintSetupState):
+    """A Quart blueprint setup state with lifecycle hook support.
+
+    This extends the Flask setup state so that blueprint lifecycle
+    hooks (startup and shutdown) are collected on the app as the
+    blueprint is registered, keyed by the blueprint's (dotted)
+    registration name.
+    """
+
+    def add_startup_hook(self, func: BeforeServingCallable) -> None:
+        """Add a startup hook to the app for this blueprint."""
+        self.app.blueprint_startup_funcs[self.name].append(func)  # type: ignore[attr-defined]
+
+    def add_shutdown_hook(self, func: AfterServingCallable) -> None:
+        """Add a shutdown hook to the app for this blueprint."""
+        self.app.blueprint_shutdown_funcs[self.name].append(func)  # type: ignore[attr-defined]
+
+
 class Blueprint(SansioBlueprint):
     """A blueprint is a collection of application properties.
 
@@ -62,6 +80,19 @@ class Blueprint(SansioBlueprint):
         self.teardown_websocket_funcs: dict[
             AppOrBlueprintKey, list[TeardownCallable]
         ] = defaultdict(list)
+
+    def make_setup_state(
+        self,
+        app: App,
+        options: dict[str, t.Any],
+        first_registration: bool = False,
+    ) -> BlueprintSetupState:
+        """Create the setup state used when registering this blueprint.
+
+        This returns the Quart :class:`BlueprintSetupState` so that
+        lifecycle hooks can be collected on the app.
+        """
+        return BlueprintSetupState(self, app, options, first_registration)
 
     def get_send_file_max_age(self, filename: str | None) -> int | None:
         """Used by :func:`send_file` to determine the ``max_age`` cache
@@ -317,6 +348,63 @@ class Blueprint(SansioBlueprint):
 
         """
         self.record_once(lambda state: state.app.before_serving(func))  # type: ignore
+        return func
+
+    @setupmethod
+    def before_app_startup(self, func: T_before_serving) -> T_before_serving:
+        """Add a startup hook for this blueprint.
+
+        This is designed to be used as a decorator. The function is
+        run when the app starts up, after the app's own
+        ``before_serving`` functions, in the order the blueprints were
+        registered on the app. For nested blueprints the parent's
+        hooks run before the child's.
+
+        Unlike app level ``before_serving`` functions, a failure in
+        one blueprint's startup hook does not prevent the other
+        blueprints from starting, nor does it fail the app's startup.
+        The failure is collected on the app's
+        ``blueprint_startup_errors`` dictionary. An example usage,
+
+        .. code-block:: python
+
+            blueprint = Blueprint(__name__)
+            @blueprint.before_app_startup
+            async def startup():
+                ...  # Acquire blueprint resources, e.g. a db pool
+
+        Arguments:
+            func: The startup function itself.
+        """
+        self.record_once(lambda state: state.add_startup_hook(func))  # type: ignore[attr-defined]
+        return func
+
+    @setupmethod
+    def after_app_shutdown(self, func: T_after_serving) -> T_after_serving:
+        """Add a shutdown hook for this blueprint.
+
+        This is designed to be used as a decorator. The function is
+        run when the app shuts down, before the app's own
+        ``after_serving`` functions, in the reverse order the
+        blueprints were registered on the app. For nested blueprints
+        the child's hooks run before the parent's.
+
+        A failure in one blueprint's shutdown hook does not prevent
+        the other blueprints from shutting down. The failure is
+        collected on the app's ``blueprint_shutdown_errors``
+        dictionary. An example usage,
+
+        .. code-block:: python
+
+            blueprint = Blueprint(__name__)
+            @blueprint.after_app_shutdown
+            async def shutdown():
+                ...  # Release blueprint resources, e.g. a db pool
+
+        Arguments:
+            func: The shutdown function itself.
+        """
+        self.record_once(lambda state: state.add_shutdown_hook(func))  # type: ignore[attr-defined]
         return func
 
     @setupmethod

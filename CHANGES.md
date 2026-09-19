@@ -2,6 +2,13 @@
 
 Unreleased
 
+- Add blueprint lifecycle hooks: ``Blueprint.before_app_startup`` and
+  ``Blueprint.after_app_shutdown``. Hooks run in blueprint registration
+  order at startup (parents before nested children) and in reverse order
+  at shutdown. A failing blueprint hook is isolated: it is collected on
+  ``app.blueprint_startup_errors`` / ``app.blueprint_shutdown_errors``
+  and reported via the ``got_serving_exception`` signal without failing
+  the app or preventing other blueprints' hooks from running.
 - Flask backport: Fix signing key selection order when key rotation is enabled
   via ``SECRET_KEY_FALLBACKS``.
   <https://github.com/pallets/flask/security/advisories/GHSA-4grg-w6v8-c28g>
